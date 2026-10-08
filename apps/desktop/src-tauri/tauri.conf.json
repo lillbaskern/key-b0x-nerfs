@@ -27,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "icon": [
       "icons/icon.png",
       "icons/128x128.png",
@@ -42,7 +42,8 @@
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
         "silent": true
-      }
+      },
+      "signCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/signpath-sign.ps1 -FilePath %1"
     }
   },
   "plugins": {
