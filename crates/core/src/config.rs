@@ -8,6 +8,7 @@ pub struct MeleeConfig {
     pub down_diagonal: DownDiagonalBehavior,
     pub horizontal_socd_override: HorizontalSocdOverride,
     pub airdodge: AirdodgeConfig,
+    pub nerfs: NerfConfig,
 }
 
 impl Default for MeleeConfig {
@@ -17,6 +18,48 @@ impl Default for MeleeConfig {
             down_diagonal: DownDiagonalBehavior::default(),
             horizontal_socd_override: HorizontalSocdOverride::default(),
             airdodge: AirdodgeConfig::default(),
+            nerfs: NerfConfig::default(),
+        }
+    }
+}
+
+/// Rectangle controller nerfs from the Melee controller ruleset proposal.
+///
+/// Each flag maps to one of the mandated nerf families:
+/// `travel_time` (travel time simulation), `fuzzing` (output fuzzing),
+/// `coordinate_limits` (limits on target coordinates, including the L/R angle
+/// lockout and reverse neutral-B lockout) and `timing_lockouts` (SDI and
+/// pivot/crouch timing lockouts). `enabled` gates all of them at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NerfConfig {
+    pub enabled: bool,
+    pub travel_time: bool,
+    pub fuzzing: bool,
+    pub coordinate_limits: bool,
+    pub timing_lockouts: bool,
+}
+
+impl Default for NerfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            travel_time: true,
+            fuzzing: true,
+            coordinate_limits: true,
+            timing_lockouts: true,
+        }
+    }
+}
+
+impl NerfConfig {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            travel_time: false,
+            fuzzing: false,
+            coordinate_limits: false,
+            timing_lockouts: false,
         }
     }
 }
@@ -54,10 +97,10 @@ pub struct SocdConfig {
 impl Default for SocdConfig {
     fn default() -> Self {
         Self {
-            main_x: SocdMode::SecondInputPriorityNoReactivation,
-            main_y: SocdMode::SecondInputPriorityNoReactivation,
-            c_x: SocdMode::SecondInputPriorityNoReactivation,
-            c_y: SocdMode::SecondInputPriorityNoReactivation,
+            main_x: SocdMode::Neutral,
+            main_y: SocdMode::Neutral,
+            c_x: SocdMode::Neutral,
+            c_y: SocdMode::Neutral,
         }
     }
 }

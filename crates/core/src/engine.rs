@@ -19,12 +19,15 @@ use crate::coords::{
     COORDS_VERTICAL_MOD_X, COORDS_VERTICAL_MOD_Y, DOLPHIN_STICK_RADIUS, GAMECUBE_STICK_RADIUS,
     LIGHT_SHIELD_VALUE, MID_SHIELD_VALUE, TRIGGER_AXIS_MAX,
 };
+use crate::nerfs::{NerfContext, NerfRuntime, NerfSettings};
 use crate::socd::{SocdPairState, resolve_pair};
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct MeleeEngine {
     config: MeleeConfig,
     state: MeleeState,
+    nerfs: NerfRuntime,
 }
 
 impl MeleeEngine {
@@ -34,6 +37,7 @@ impl MeleeEngine {
         Ok(Self {
             config,
             state: MeleeState::default(),
+            nerfs: NerfRuntime::default(),
         })
     }
 
@@ -44,16 +48,65 @@ impl MeleeEngine {
     pub fn handle_event(&mut self, event: InputEvent) -> ControllerSnapshot {
         self.state.raw.apply_event(event);
         self.state.recompute(&self.config);
+        self.apply_nerfs(Instant::now(), true);
         self.snapshot()
     }
 
     pub fn snapshot(&self) -> ControllerSnapshot {
-        self.state.snapshot(&self.config)
+        let nerf_output = self.config.nerfs.enabled.then(|| self.nerfs.output());
+        self.state.snapshot(&self.config, nerf_output)
+    }
+
+    /// Advances time-dependent nerf output (travel time simulation). Callers
+    /// should invoke this periodically while [`MeleeEngine::is_traveling`]
+    /// reports true so in-flight travel reaches the transport between inputs.
+    pub fn tick(&mut self, now: Instant) {
+        if !self.config.nerfs.enabled {
+            return;
+        }
+
+        self.nerfs.tick(now);
+    }
+
+    pub fn is_traveling(&self) -> bool {
+        self.config.nerfs.enabled && self.nerfs.is_traveling()
     }
 
     pub fn reset(&mut self) -> ControllerSnapshot {
         self.state = MeleeState::default();
+        self.nerfs = NerfRuntime::default();
         self.snapshot()
+    }
+
+    fn apply_nerfs(&mut self, now: Instant, user_input_changed: bool) {
+        if !self.config.nerfs.enabled {
+            return;
+        }
+
+        let (logical, nerf_context) = {
+            let context = FrameContext {
+                raw: &self.state.raw,
+                resolved: &self.state.resolved,
+            };
+            let logical = main_stick_coords(&context, &self.config);
+            let raw_horizontal = match self.state.resolved.main_horizontal {
+                Some(Horizontal::Left) => -1,
+                Some(Horizontal::Right) => 1,
+                None => 0,
+            };
+            (
+                logical,
+                NerfContext {
+                    shield: context.any_shield(),
+                    b: context.button_b(),
+                    raw_horizontal,
+                },
+            )
+        };
+
+        let settings = NerfSettings::from(&self.config.nerfs);
+        self.nerfs
+            .apply(now, logical, nerf_context, settings, user_input_changed);
     }
 }
 
@@ -75,12 +128,16 @@ impl MeleeState {
         self.resolved = ResolvedDirections::resolve(&self.raw, config, &mut self.socd);
     }
 
-    fn snapshot(&self, config: &MeleeConfig) -> ControllerSnapshot {
+    fn snapshot(
+        &self,
+        config: &MeleeConfig,
+        nerf_output: Option<(f64, f64)>,
+    ) -> ControllerSnapshot {
         let context = FrameContext {
             raw: &self.raw,
             resolved: &self.resolved,
         };
-        let (main_x, main_y) = main_stick_coords(&context, config);
+        let (main_x, main_y) = nerf_output.unwrap_or_else(|| main_stick_coords(&context, config));
         let (c_x, c_y) = c_stick_coords(&context);
 
         ControllerSnapshot {
@@ -569,10 +626,25 @@ fn normalize_trigger(value: u8) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AirdodgeConfig, DownDiagonalBehavior, HorizontalSocdOverride, SocdMode};
+    use crate::config::{
+        AirdodgeConfig, DownDiagonalBehavior, HorizontalSocdOverride, NerfConfig, SocdMode,
+    };
+    use crate::nerfs::STICK_UNIT;
+    use std::time::Duration;
 
     fn approx_eq(lhs: f64, rhs: f64) {
         assert!((lhs - rhs).abs() < 1e-9, "{lhs} != {rhs}");
+    }
+
+    fn plain_config() -> MeleeConfig {
+        MeleeConfig {
+            nerfs: NerfConfig::disabled(),
+            ..MeleeConfig::default()
+        }
+    }
+
+    fn plain_engine() -> MeleeEngine {
+        MeleeEngine::try_new(plain_config()).expect("plain config must be valid")
     }
 
     fn press(engine: &mut MeleeEngine, binding: BindingId) -> ControllerSnapshot {
@@ -596,8 +668,19 @@ mod tests {
     }
 
     #[test]
-    fn default_socd_is_second_input_priority_without_reactivation() {
-        let mut engine = MeleeEngine::default();
+    fn default_socd_is_neutral() {
+        let mut engine = plain_engine();
+
+        press(&mut engine, BindingId::AnalogRight);
+        let snapshot = press(&mut engine, BindingId::AnalogLeft);
+        approx_eq(snapshot.main_x, 0.5);
+    }
+
+    #[test]
+    fn second_input_priority_without_reactivation_when_configured() {
+        let mut config = plain_config();
+        config.socd.main_x = SocdMode::SecondInputPriorityNoReactivation;
+        let mut engine = MeleeEngine::try_new(config).unwrap();
 
         press(&mut engine, BindingId::AnalogRight);
         let snapshot = press(&mut engine, BindingId::AnalogLeft);
@@ -609,7 +692,7 @@ mod tests {
 
     #[test]
     fn second_input_priority_reactivates_when_configured() {
-        let mut config = MeleeConfig::default();
+        let mut config = plain_config();
         config.socd.main_x = SocdMode::SecondInputPriority;
         let mut engine = MeleeEngine::try_new(config).unwrap();
 
@@ -621,7 +704,7 @@ mod tests {
 
     #[test]
     fn neutral_socd_can_zero_out_horizontal_axis() {
-        let mut config = MeleeConfig::default();
+        let mut config = plain_config();
         config.socd.main_x = SocdMode::Neutral;
         let mut engine = MeleeEngine::try_new(config).unwrap();
 
@@ -632,7 +715,7 @@ mod tests {
 
     #[test]
     fn crouch_walk_os_changes_down_diagonal_coordinate() {
-        let mut config = MeleeConfig::default();
+        let mut config = plain_config();
         config.down_diagonal = DownDiagonalBehavior::CrouchWalkOs;
         let mut engine = MeleeEngine::try_new(config).unwrap();
 
@@ -644,7 +727,7 @@ mod tests {
 
     #[test]
     fn default_down_diagonal_preserves_auto_jab_cancel_coordinate() {
-        let mut engine = MeleeEngine::default();
+        let mut engine = plain_engine();
 
         press(&mut engine, BindingId::AnalogDown);
         let snapshot = press(&mut engine, BindingId::AnalogRight);
@@ -654,7 +737,11 @@ mod tests {
 
     #[test]
     fn default_horizontal_socd_override_matches_haybox_ledgedash_behavior() {
-        let mut engine = MeleeEngine::default();
+        let mut config = plain_config();
+        // The override picks the surviving direction, so resolution must not
+        // be neutral for this scenario.
+        config.socd.main_x = SocdMode::SecondInputPriorityNoReactivation;
+        let mut engine = MeleeEngine::try_new(config).unwrap();
 
         press(&mut engine, BindingId::AnalogRight);
         press(&mut engine, BindingId::AnalogLeft);
@@ -665,7 +752,8 @@ mod tests {
 
     #[test]
     fn disabling_horizontal_socd_override_restores_modifier_coordinate() {
-        let mut config = MeleeConfig::default();
+        let mut config = plain_config();
+        config.socd.main_x = SocdMode::SecondInputPriorityNoReactivation;
         config.horizontal_socd_override = HorizontalSocdOverride::Disabled;
         let mut engine = MeleeEngine::try_new(config).unwrap();
 
@@ -678,7 +766,7 @@ mod tests {
 
     #[test]
     fn custom_airdodge_overrides_mod_x_shield_diagonal() {
-        let mut config = MeleeConfig::default();
+        let mut config = plain_config();
         config.airdodge = AirdodgeConfig::CustomModXDiagonal { x: 0.6, y: 0.4 };
         let mut engine = MeleeEngine::try_new(config).unwrap();
 
@@ -692,7 +780,7 @@ mod tests {
 
     #[test]
     fn default_airdodge_keeps_reference_coordinate() {
-        let mut engine = MeleeEngine::default();
+        let mut engine = plain_engine();
 
         press(&mut engine, BindingId::L);
         press(&mut engine, BindingId::AnalogUp);
@@ -710,7 +798,7 @@ mod tests {
 
     #[test]
     fn c_stick_diagonal_matches_reference_coords() {
-        let mut engine = MeleeEngine::default();
+        let mut engine = plain_engine();
 
         press(&mut engine, BindingId::CUp);
         let snapshot = press(&mut engine, BindingId::CRight);
@@ -726,5 +814,57 @@ mod tests {
         };
 
         assert!(MeleeEngine::try_new(config).is_err());
+    }
+
+    #[test]
+    fn nerfs_travel_time_delays_main_stick_output() {
+        let mut engine = MeleeEngine::default();
+        let start = Instant::now();
+
+        let snapshot = press(&mut engine, BindingId::AnalogRight);
+        assert!(engine.is_traveling());
+        assert!(snapshot.main_x >= normalize_axis(0.0) && snapshot.main_x < normalize_axis(1.0));
+
+        engine.tick(start + Duration::from_millis(3));
+        let mid = engine.snapshot();
+        assert!(mid.main_x >= normalize_axis(0.0) && mid.main_x < normalize_axis(1.0));
+
+        engine.tick(start + Duration::from_millis(30));
+        let settled = engine.snapshot();
+        assert!(!engine.is_traveling());
+        approx_eq(settled.main_x, normalize_axis(1.0));
+        approx_eq(settled.main_y, normalize_axis(0.0));
+    }
+
+    #[test]
+    fn nerfs_fuzz_interior_coordinates_within_one_unit() {
+        let mut engine = MeleeEngine::default();
+        let start = Instant::now();
+
+        press(&mut engine, BindingId::AnalogUp);
+        press(&mut engine, BindingId::ModY);
+        engine.tick(start + Duration::from_millis(30));
+
+        let snapshot = engine.snapshot();
+        let expected = normalize_axis(COORDS_VERTICAL_MOD_Y.1);
+        let one_unit = normalize_axis(COORDS_VERTICAL_MOD_Y.1 + STICK_UNIT) - expected;
+        let distance = (snapshot.main_y - expected).abs();
+        assert!(
+            distance <= one_unit + 1e-9,
+            "main_y {} drifted {} from {}",
+            snapshot.main_y,
+            distance,
+            expected
+        );
+        approx_eq(snapshot.main_x, normalize_axis(0.0));
+    }
+
+    #[test]
+    fn disabled_nerfs_never_report_traveling() {
+        let mut engine = plain_engine();
+
+        let snapshot = press(&mut engine, BindingId::AnalogRight);
+        assert!(!engine.is_traveling());
+        approx_eq(snapshot.main_x, normalize_axis(1.0));
     }
 }

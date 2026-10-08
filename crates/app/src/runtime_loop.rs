@@ -7,24 +7,56 @@ use crate::transport::SnapshotEmitter;
 use anyhow::{Context, Result, bail};
 use key_b0x_core::{InputEvent, MeleeEngine};
 use key_b0x_platform::{KeyboardBackend, KeyboardCaptureSession, TransportStatus};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const SHUTDOWN_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 const RECONNECT_PROBE_INTERVAL: Duration = Duration::from_millis(75);
+/// Granularity of travel-time emissions while the engine is moving the
+/// control stick; the nerfs need up to 6-12 ms of linear travel to reach the
+/// pipe between physical key events.
+const TRAVEL_TICK_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(debug_assertions)]
 const DEV_LATENCY_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run_worker(context: RuntimeWorkerContext) {
-    if let Err(error) = run_capture_loop(&context) {
-        if !context.cancel.load(Ordering::Relaxed) {
-            write_runtime_state(
-                &context.state,
-                RuntimeState::error(error.to_string()),
-                context.listener.as_ref(),
-            );
+    run_worker_guarded(&context, run_capture_loop);
+}
+
+/// Runs the worker body, converting a panic into an error state so a crash
+/// can never leave the runtime stuck in `Starting` (a panicked worker never
+/// writes another state on its own).
+fn run_worker_guarded(
+    context: &RuntimeWorkerContext,
+    body: impl FnOnce(&RuntimeWorkerContext) -> Result<()>,
+) {
+    let outcome = catch_unwind(AssertUnwindSafe(|| body(context)));
+
+    let error = match outcome {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.to_string(),
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            format!("runtime worker panicked: {detail}")
         }
+    };
+
+    // A cancelled worker is being stopped on purpose; the controller already
+    // owns the final state.
+    if context.cancel.load(Ordering::Relaxed) {
+        return;
     }
+
+    write_runtime_state(
+        &context.state,
+        RuntimeState::error(error),
+        context.listener.as_ref(),
+    );
 }
 
 fn run_capture_loop(context: &RuntimeWorkerContext) -> Result<()> {
@@ -35,10 +67,22 @@ fn run_capture_loop(context: &RuntimeWorkerContext) -> Result<()> {
         bail!("only port 1 is supported in this proof of concept");
     }
 
+    // Startup takes a moment (config IO, device enumeration, opening the
+    // raw-input session). Bail out between the steps when a stop is already
+    // pending so `stop()` joins promptly instead of stalling every queued
+    // command for the whole startup.
+    if context.cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     let backend = active_keyboard_backend();
     let keyboards = backend.list_keyboards()?;
     if keyboards.is_empty() {
         bail!("no keyboards detected");
+    }
+
+    if context.cancel.load(Ordering::Relaxed) {
+        return Ok(());
     }
 
     let bindings = ResolvedBindings::new(&config)?;
@@ -48,6 +92,11 @@ fn run_capture_loop(context: &RuntimeWorkerContext) -> Result<()> {
     let mut last_reconnect_probe_at = Instant::now();
     let mut latency_logger = DevLatencyLogger::new();
 
+    // Dropping an early-returned capture releases its raw-input window.
+    if context.cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     let initial_status = emitter.emit(&engine.snapshot())?;
     record_transport_status(context, initial_status, &mut last_reconnect_probe_at);
     let mut last_transport_status = initial_status;
@@ -56,9 +105,18 @@ fn run_capture_loop(context: &RuntimeWorkerContext) -> Result<()> {
         let changes = capture.wait_for_events(next_wait_timeout(
             last_transport_status,
             last_reconnect_probe_at.elapsed(),
+            engine.is_traveling(),
         ))?;
         if changes.is_empty() {
-            if should_probe_reconnect(last_transport_status, last_reconnect_probe_at.elapsed()) {
+            if engine.is_traveling() {
+                engine.tick(Instant::now());
+                let status = emitter.emit(&engine.snapshot())?;
+                record_transport_status(context, status, &mut last_reconnect_probe_at);
+                last_transport_status = status;
+            } else if should_probe_reconnect(
+                last_transport_status,
+                last_reconnect_probe_at.elapsed(),
+            ) {
                 let status = emitter.emit(&engine.snapshot())?;
                 record_transport_status(context, status, &mut last_reconnect_probe_at);
                 last_transport_status = status;
@@ -136,7 +194,11 @@ fn should_probe_reconnect(last_status: TransportStatus, elapsed_since_probe: Dur
         && elapsed_since_probe >= RECONNECT_PROBE_INTERVAL
 }
 
-fn next_wait_timeout(last_status: TransportStatus, elapsed_since_probe: Duration) -> Duration {
+fn next_wait_timeout(
+    last_status: TransportStatus,
+    elapsed_since_probe: Duration,
+    traveling: bool,
+) -> Duration {
     let reconnect_wait = match last_status {
         TransportStatus::WaitingForReader => {
             RECONNECT_PROBE_INTERVAL.saturating_sub(elapsed_since_probe)
@@ -144,7 +206,12 @@ fn next_wait_timeout(last_status: TransportStatus, elapsed_since_probe: Duration
         TransportStatus::Connected | TransportStatus::NewlyConnected => SHUTDOWN_WAIT_INTERVAL,
     };
 
-    reconnect_wait.min(SHUTDOWN_WAIT_INTERVAL)
+    let mut timeout = reconnect_wait.min(SHUTDOWN_WAIT_INTERVAL);
+    if traveling {
+        timeout = timeout.min(TRAVEL_TICK_INTERVAL);
+    }
+
+    timeout
 }
 
 #[cfg(debug_assertions)]
@@ -228,6 +295,47 @@ fn duration_ms(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::SharedRuntimeState;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn panic_test_context(cancelled: bool) -> RuntimeWorkerContext {
+        RuntimeWorkerContext {
+            config_path: PathBuf::from("unused.toml"),
+            cancel: Arc::new(AtomicBool::new(cancelled)),
+            state: SharedRuntimeState::default(),
+            listener: None,
+        }
+    }
+
+    #[test]
+    fn worker_panic_writes_error_state_instead_of_sticking() {
+        let context = panic_test_context(false);
+
+        run_worker_guarded(&context, |_| panic!("boom"));
+
+        let state = read_runtime_state(&context.state);
+        assert_eq!(state.status, RuntimeStatus::Error);
+        assert!(
+            state
+                .last_error
+                .expect("error message")
+                .contains("runtime worker panicked")
+        );
+    }
+
+    #[test]
+    fn worker_panic_while_cancelling_stays_silent() {
+        let context = panic_test_context(true);
+
+        run_worker_guarded(&context, |_| panic!("boom"));
+
+        assert_eq!(
+            read_runtime_state(&context.state).status,
+            RuntimeStatus::Idle
+        );
+    }
 
     #[test]
     fn reconnect_probe_waits_for_interval_when_reader_is_missing() {
@@ -256,13 +364,14 @@ mod tests {
     #[test]
     fn wait_timeout_is_bounded_by_shutdown_budget_when_connected() {
         assert_eq!(
-            next_wait_timeout(TransportStatus::Connected, Duration::ZERO),
+            next_wait_timeout(TransportStatus::Connected, Duration::ZERO, false),
             SHUTDOWN_WAIT_INTERVAL,
         );
         assert_eq!(
             next_wait_timeout(
                 TransportStatus::NewlyConnected,
-                RECONNECT_PROBE_INTERVAL * 2
+                RECONNECT_PROBE_INTERVAL * 2,
+                false
             ),
             SHUTDOWN_WAIT_INTERVAL,
         );
@@ -271,19 +380,40 @@ mod tests {
     #[test]
     fn wait_timeout_reaches_zero_when_reconnect_probe_is_due() {
         assert_eq!(
-            next_wait_timeout(TransportStatus::WaitingForReader, Duration::ZERO),
+            next_wait_timeout(TransportStatus::WaitingForReader, Duration::ZERO, false),
             SHUTDOWN_WAIT_INTERVAL,
         );
         assert_eq!(
             next_wait_timeout(
                 TransportStatus::WaitingForReader,
                 RECONNECT_PROBE_INTERVAL - Duration::from_millis(5),
+                false,
             ),
             Duration::from_millis(5),
         );
         assert_eq!(
-            next_wait_timeout(TransportStatus::WaitingForReader, RECONNECT_PROBE_INTERVAL,),
+            next_wait_timeout(
+                TransportStatus::WaitingForReader,
+                RECONNECT_PROBE_INTERVAL,
+                false
+            ),
             Duration::ZERO,
+        );
+    }
+
+    #[test]
+    fn wait_timeout_drops_to_travel_tick_interval_while_traveling() {
+        assert_eq!(
+            next_wait_timeout(TransportStatus::Connected, Duration::ZERO, true),
+            TRAVEL_TICK_INTERVAL,
+        );
+        assert_eq!(
+            next_wait_timeout(
+                TransportStatus::WaitingForReader,
+                RECONNECT_PROBE_INTERVAL - Duration::from_millis(5),
+                true,
+            ),
+            Duration::from_millis(5).min(TRAVEL_TICK_INTERVAL),
         );
     }
 

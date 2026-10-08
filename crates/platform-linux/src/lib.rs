@@ -75,6 +75,7 @@ normalized_key_pairs! {
     (BracketLeft, KEY_LEFTBRACE),
     (BracketRight, KEY_RIGHTBRACE),
     (Backslash, KEY_BACKSLASH),
+    (IntlBackslash, KEY_102ND),
     (Semicolon, KEY_SEMICOLON),
     (Quote, KEY_APOSTROPHE),
     (Backquote, KEY_GRAVE),

@@ -3,6 +3,7 @@ use anyhow::Result;
 use key_b0x_platform::{KeyChange, KeyboardBackend, KeyboardCaptureSession, NormalizedKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -68,18 +69,52 @@ pub struct KeyboardTestWorkerContext {
 }
 
 pub fn run_worker(context: KeyboardTestWorkerContext) {
-    if let Err(error) = run_capture_loop(&context) {
-        if !context.cancel.load(Ordering::Relaxed) {
-            write_keyboard_test_state(
-                &context.state,
-                KeyboardTestState::error(error.to_string()),
-                context.listener.as_ref(),
-            );
+    run_worker_guarded(&context, run_capture_loop);
+}
+
+/// Runs the worker body, converting a panic into an error state so a crash
+/// can never leave the keyboard test stuck in `Running` (a panicked worker
+/// never writes another state on its own).
+fn run_worker_guarded(
+    context: &KeyboardTestWorkerContext,
+    body: impl FnOnce(&KeyboardTestWorkerContext) -> Result<()>,
+) {
+    let outcome = catch_unwind(AssertUnwindSafe(|| body(context)));
+
+    let error = match outcome {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.to_string(),
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            format!("keyboard test worker panicked: {detail}")
         }
+    };
+
+    // A cancelled worker is being stopped on purpose; the controller already
+    // owns the final state.
+    if context.cancel.load(Ordering::Relaxed) {
+        return;
     }
+
+    write_keyboard_test_state(
+        &context.state,
+        KeyboardTestState::error(error),
+        context.listener.as_ref(),
+    );
 }
 
 fn run_capture_loop(context: &KeyboardTestWorkerContext) -> Result<()> {
+    // Bail out before opening the capture session when a stop is already
+    // pending so `stop()` joins promptly instead of stalling every queued
+    // command behind the session teardown.
+    if context.cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     let backend = active_keyboard_backend();
     let mut capture = backend.open()?;
     let mut pressed_keys = BTreeSet::new();
@@ -150,7 +185,44 @@ pub fn write_keyboard_test_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use std::time::Instant;
+
+    fn panic_test_context(cancelled: bool) -> KeyboardTestWorkerContext {
+        KeyboardTestWorkerContext {
+            cancel: Arc::new(AtomicBool::new(cancelled)),
+            state: Default::default(),
+            listener: None,
+        }
+    }
+
+    #[test]
+    fn worker_panic_writes_error_state_instead_of_sticking() {
+        let context = panic_test_context(false);
+
+        run_worker_guarded(&context, |_| panic!("boom"));
+
+        let state = read_keyboard_test_state(&context.state);
+        assert_eq!(state.status, KeyboardTestStatus::Error);
+        assert!(
+            state
+                .last_error
+                .expect("error message")
+                .contains("keyboard test worker panicked")
+        );
+    }
+
+    #[test]
+    fn worker_panic_while_cancelling_stays_silent() {
+        let context = panic_test_context(true);
+
+        run_worker_guarded(&context, |_| panic!("boom"));
+
+        assert_eq!(
+            read_keyboard_test_state(&context.state).status,
+            KeyboardTestStatus::Idle
+        );
+    }
 
     #[test]
     fn apply_key_changes_tracks_pressed_keys() {

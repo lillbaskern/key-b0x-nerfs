@@ -95,6 +95,7 @@ normalized_keys! {
     BracketLeft,
     BracketRight,
     Backslash,
+    IntlBackslash,
     Semicolon,
     Quote,
     Backquote,

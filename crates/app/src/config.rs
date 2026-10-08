@@ -315,6 +315,32 @@ d_right = "ArrowRight"
     }
 
     #[test]
+    fn configs_without_nerf_section_enable_nerfs_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+version = 2
+slippi_user_path = "/tmp/SlippiOnline"
+port = 1
+
+[melee]
+down_diagonal = "auto_jab_cancel"
+"#,
+        )
+        .unwrap();
+
+        let config = load(&config_path).unwrap();
+        assert_eq!(config.melee.nerfs, key_b0x_core::NerfConfig::default());
+        assert!(config.melee.nerfs.enabled);
+        assert!(config.melee.nerfs.travel_time);
+        assert!(config.melee.nerfs.fuzzing);
+        assert!(config.melee.nerfs.coordinate_limits);
+        assert!(config.melee.nerfs.timing_lockouts);
+    }
+
+    #[test]
     fn save_normalizes_port_and_validates_melee() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");

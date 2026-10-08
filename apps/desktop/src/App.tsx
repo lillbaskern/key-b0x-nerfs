@@ -20,7 +20,8 @@ import {
   findDuplicateBindings,
   formatBindingLabel,
   formatKeyLabel,
-  isNormalizedKey
+  isNormalizedKey,
+  layoutKeyLabel
 } from '../shared/model';
 
 type AppView = 'onboarding' | 'dashboard';
@@ -41,7 +42,18 @@ type MeleeSettingsDraft = {
   airdodge_kind: MeleeConfig['airdodge']['kind'];
   airdodge_x: string;
   airdodge_y: string;
+  nerfs_enabled: boolean;
+  nerfs_travel_time: boolean;
+  nerfs_fuzzing: boolean;
+  nerfs_coordinate_limits: boolean;
+  nerfs_timing_lockouts: boolean;
 };
+
+type NerfToggleField =
+  | 'nerfs_travel_time'
+  | 'nerfs_fuzzing'
+  | 'nerfs_coordinate_limits'
+  | 'nerfs_timing_lockouts';
 
 type SelectOption<T extends string> = {
   value: T;
@@ -75,20 +87,20 @@ const TOAST_LIFETIME_MS = 3200;
 const WAITING_FOR_SLIPPI_TOAST_ID = -1;
 const SOCD_MODE_OPTIONS: SelectOption<SocdMode>[] = [
   {
+    value: 'neutral',
+    label: 'Neutral',
+    detail: 'Opposites cancel out',
+    tag: 'Default'
+  },
+  {
     value: 'second_input_priority_no_reactivation',
     label: '2IP No Reactivation',
-    detail: 'Release the newer opposite direction: stay neutral until the held direction is re-pressed',
-    tag: 'Default'
+    detail: 'Release the newer opposite direction: stay neutral until the held direction is re-pressed'
   },
   {
     value: 'second_input_priority',
     label: '2IP Reactivation',
     detail: 'Release the newer opposite direction: return to the direction still held'
-  },
-  {
-    value: 'neutral',
-    label: 'Neutral',
-    detail: 'Opposites cancel out'
   },
   {
     value: 'dir1_priority',
@@ -140,6 +152,41 @@ const AIRDODGE_KIND_OPTIONS: SelectOption<MeleeSettingsDraft['airdodge_kind']>[]
     detail: 'Tune the custom X/Y diagonal'
   }
 ];
+const NERF_MASTER_OPTIONS: SelectOption<'enabled' | 'disabled'>[] = [
+  {
+    value: 'enabled',
+    label: 'Enabled',
+    detail: 'Apply the rectangle nerfs from the Melee controller ruleset proposal',
+    tag: 'Ruleset'
+  },
+  {
+    value: 'disabled',
+    label: 'Disabled',
+    detail: 'Raw coordinates: no travel time, fuzzing, coordinate limits, or lockouts'
+  }
+];
+const NERF_TOGGLE_ROWS: { field: NerfToggleField; label: string; detail: string }[] = [
+  {
+    field: 'nerfs_travel_time',
+    label: 'Travel Time Simulation',
+    detail: 'Linear 6 ms to rim cardinals/diagonals and 12 ms to everything else, matching very fast analog sticks.'
+  },
+  {
+    field: 'nerfs_fuzzing',
+    label: 'Output Fuzzing',
+    detail: 'Nudges output by 1 unit so single coordinates cannot be targeted consistently.'
+  },
+  {
+    field: 'nerfs_coordinate_limits',
+    label: 'Coordinate Limits',
+    detail: 'Enforces the 20°/27° angle limits, bans the coordinates next to the deadzone, and forces tilt side-B out of neutral-B.'
+  },
+  {
+    field: 'nerfs_timing_lockouts',
+    label: 'Timing Lockouts',
+    detail: 'Caps burst SDI and delays crouch/pivot tilts so buttons cannot beat analog stick timings.'
+  }
+];
 
 function App() {
   const [appView, setAppView] = useState<AppView>('onboarding');
@@ -155,9 +202,16 @@ function App() {
   const [keyboardTestOpen, setKeyboardTestOpen] = useState(false);
   const [keyboardTestSource, setKeyboardTestSource] = useState<KeyboardTestSource | null>(null);
   const [keyboardTestBusy, setKeyboardTestBusy] = useState(false);
-  const [keyboardTestResumeRuntime, setKeyboardTestResumeRuntime] = useState(false);
+  // The busy guard, resume intent, and queued close requests are tracked in
+  // refs as well: React state updates are asynchronous, so two same-tick
+  // events (Escape + blur, rapid clicks) would otherwise both observe a stale
+  // `false` guard and run concurrently.
+  const keyboardTestBusyRef = useRef(false);
+  const keyboardTestResumeRuntimeRef = useRef(false);
+  const keyboardTestCloseRequestedRef = useRef(false);
   const [slippiPathDraft, setSlippiPathDraft] = useState('');
   const [captureTarget, setCaptureTarget] = useState<BindingId | null>(null);
+  const [keyboardLayout, setKeyboardLayout] = useState<ReadonlyMap<string, string> | null>(null);
   const [loading, setLoading] = useState(true);
   const [screenError, setScreenError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -165,6 +219,52 @@ function App() {
   const nextToastId = useRef(0);
   const toastTimeouts = useRef(new Map<number, number>());
   const hasAutoCheckedForUpdates = useRef(false);
+
+  // Keep key labels in sync with the OS keyboard layout so bindings show the
+  // characters printed on the user's keycaps (e.g. "å" instead of the US
+  // ";"). Falls back to US labels when the webview lacks the Keyboard API.
+  useEffect(() => {
+    const keyboard = navigator.keyboard;
+    if (!keyboard) {
+      return;
+    }
+
+    let cancelled = false;
+    const refreshLayout = () => {
+      void keyboard
+        .getLayoutMap()
+        .then((layoutMap) => {
+          if (!cancelled) {
+            setKeyboardLayout(layoutMap);
+          }
+        })
+        .catch(() => {
+          // Keep US fallback labels.
+        });
+    };
+
+    refreshLayout();
+    // Also refresh when the window regains focus: users typically switch
+    // keyboard layouts with a hotkey while the app is in the background.
+    window.addEventListener('focus', refreshLayout);
+    // The spec's layoutchange event is not implemented in all webviews
+    // (WebView2 exposes a Keyboard object without EventTarget methods), so
+    // only subscribe when actually available.
+    if (typeof keyboard.addEventListener === 'function') {
+      keyboard.addEventListener('layoutchange', refreshLayout);
+    }
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', refreshLayout);
+      if (typeof keyboard.removeEventListener === 'function') {
+        keyboard.removeEventListener('layoutchange', refreshLayout);
+      }
+    };
+  }, []);
+
+  const keyLabel = (key: NormalizedKey): string =>
+    layoutKeyLabel(key, keyboardLayout ?? undefined);
 
   useEffect(() => {
     let mounted = true;
@@ -340,14 +440,14 @@ function App() {
         };
       });
       setCaptureTarget(null);
-      pushToast(`Assigned ${formatBindingLabel(target)} to ${formatKeyLabel(event.code)}.`);
+      pushToast(`Assigned ${formatBindingLabel(target)} to ${keyLabel(event.code)}.`);
     }
 
     window.addEventListener('keydown', handleKeyDown, true);
     return () => {
       window.removeEventListener('keydown', handleKeyDown, true);
     };
-  }, [captureTarget]);
+  }, [captureTarget, keyboardLayout]);
 
   const runtimeLocked = isRuntimeLocked(runtime.status);
   const meleeLocked =
@@ -382,7 +482,8 @@ function App() {
   const configurationReady = setupComplete && !setupDirty && bindingsReady;
   const dashboardNotice = getDashboardNotice({
     setupComplete,
-    duplicateGroups
+    duplicateGroups,
+    keyLabel
   });
   const updateAvailable =
     updateState.status === 'available' ||
@@ -431,7 +532,25 @@ function App() {
     return () => {
       window.removeEventListener('keydown', handleDialogKeyDown, true);
     };
-  }, [keyboardTestOpen, keyboardTestBusy, keyboardTestResumeRuntime, runtime.status]);
+  }, [keyboardTestOpen]);
+
+  useEffect(() => {
+    if (!keyboardTestOpen) {
+      return;
+    }
+
+    // Clicking away from key-b0x (for example onto the game) must not leave
+    // the runtime paused: close the test and resume as soon as the window
+    // loses focus.
+    function handleWindowBlur() {
+      void closeKeyboardTest();
+    }
+
+    window.addEventListener('blur', handleWindowBlur);
+    return () => {
+      window.removeEventListener('blur', handleWindowBlur);
+    };
+  }, [keyboardTestOpen]);
 
   async function refreshSetup() {
     const nextSetup = await api.checkSetup();
@@ -503,13 +622,30 @@ function App() {
     }
   }
 
+  async function handleReinstallProfile() {
+    setBusyAction('reinstall-profile');
+    setScreenError(null);
+
+    try {
+      await api.installProfile();
+      await refreshSetup();
+      pushToast('Controller profile reset.', 'success');
+    } catch (error) {
+      // Surface the failure as a toast: the screen-error banner lives on the
+      // dashboard, behind the open settings modal.
+      pushToast(messageFromError(error), 'error');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleSaveBindings() {
     if (!config || !bindingDraft) {
       return;
     }
 
     if (duplicateGroups.length > 0) {
-      setScreenError(duplicateMessage(duplicateGroups[0]));
+      setScreenError(duplicateMessage(duplicateGroups[0], keyLabel));
       return;
     }
 
@@ -672,27 +808,34 @@ function App() {
   }
 
   async function openKeyboardTest(source: KeyboardTestSource) {
-    if (keyboardTestBusy || runtime.status === 'starting' || runtime.status === 'stopping') {
+    if (keyboardTestBusyRef.current || runtime.status === 'starting' || runtime.status === 'stopping') {
       return;
     }
 
+    keyboardTestBusyRef.current = true;
     setKeyboardTestBusy(true);
     setKeyboardTestOpen(true);
     setKeyboardTestSource(source);
-    setKeyboardTestResumeRuntime(false);
+    keyboardTestResumeRuntimeRef.current = false;
     setKeyboardTest(IDLE_KEYBOARD_TEST);
 
     const shouldResumeRuntime = source === 'settings' && isRuntimeLive(runtime.status);
+    // Record the resume intent before the awaited stop: if the stop fails
+    // midway the runtime may still have gone down, and restarting a live
+    // runtime is a no-op on the backend.
+    keyboardTestResumeRuntimeRef.current = shouldResumeRuntime;
 
     try {
       if (shouldResumeRuntime) {
-        const nextRuntimeState = await api.stopRuntime();
-        setRuntime(nextRuntimeState);
-        setKeyboardTestResumeRuntime(true);
+        await api.stopRuntime();
       }
 
-      const nextKeyboardTestState = await api.startKeyboardTest();
-      setKeyboardTest(nextKeyboardTestState);
+      await api.startKeyboardTest();
+      // Runtime and keyboard-test state are applied exclusively through the
+      // listeners registered at mount: command responses travel on a
+      // different IPC channel than state events and may arrive after newer
+      // events, so applying them would regress the UI to a stale snapshot
+      // (for example showing "Starting" after the worker reported "Running").
     } catch (error) {
       setKeyboardTest({
         status: 'error',
@@ -700,16 +843,27 @@ function App() {
         lastError: messageFromError(error)
       });
     } finally {
+      keyboardTestBusyRef.current = false;
       setKeyboardTestBusy(false);
+
+      // A close requested while this open was in flight (for example the
+      // window losing focus) runs now that the open has settled.
+      if (keyboardTestCloseRequestedRef.current) {
+        keyboardTestCloseRequestedRef.current = false;
+        void closeKeyboardTest();
+      }
     }
   }
 
   async function closeKeyboardTest() {
-    if (keyboardTestBusy) {
+    if (keyboardTestBusyRef.current) {
+      keyboardTestCloseRequestedRef.current = true;
       return;
     }
 
-    const shouldResumeRuntime = keyboardTestResumeRuntime;
+    const shouldResumeRuntime = keyboardTestResumeRuntimeRef.current;
+    keyboardTestResumeRuntimeRef.current = false;
+    keyboardTestBusyRef.current = true;
     setKeyboardTestBusy(true);
 
     try {
@@ -720,18 +874,19 @@ function App() {
 
     setKeyboardTestOpen(false);
     setKeyboardTestSource(null);
-    setKeyboardTestResumeRuntime(false);
     setKeyboardTest(IDLE_KEYBOARD_TEST);
 
     if (shouldResumeRuntime) {
       try {
-        const nextRuntimeState = await api.startRuntime();
-        setRuntime(nextRuntimeState);
+        await api.startRuntime();
       } catch (error) {
         setScreenError(messageFromError(error));
       }
     }
 
+    // This close satisfies any request queued while it ran.
+    keyboardTestCloseRequestedRef.current = false;
+    keyboardTestBusyRef.current = false;
     setKeyboardTestBusy(false);
   }
 
@@ -980,6 +1135,7 @@ function App() {
               duplicateBindings={duplicateBindings}
               captureTarget={captureTarget}
               bindingsDirty={bindingsDirty}
+              keyLabel={keyLabel}
               onRestoreDefaults={handleRestoreDefaults}
               onSaveBindings={handleSaveBindings}
               onSelectBinding={(binding) => {
@@ -1037,6 +1193,11 @@ function App() {
                 onBrowsePath={handleBrowseSlippiPath}
                 onApplySetup={setupDirty || !setupComplete ? handleApplySetup : undefined}
               />
+              <ProfileResetCard
+                busy={busyAction === 'reinstall-profile' || busyAction === 'apply-setup'}
+                slippiReady={Boolean(setup?.slippiFound)}
+                onReset={handleReinstallProfile}
+              />
             </div>
 
             <div className="settings-section">
@@ -1087,6 +1248,7 @@ function App() {
         <KeyboardTestModal
           keyboardTest={keyboardTest}
           busy={keyboardTestBusy}
+          keyLabel={keyLabel}
           onClose={() => {
             void closeKeyboardTest();
           }}
@@ -1094,6 +1256,48 @@ function App() {
       ) : null}
 
       <ToastViewport toasts={toasts} runtimeStatus={runtime.status} onDismiss={dismissToast} />
+    </div>
+  );
+}
+
+function ProfileResetCard({
+  busy,
+  slippiReady,
+  onReset
+}: {
+  busy: boolean;
+  slippiReady: boolean;
+  onReset: () => Promise<void>;
+}) {
+  return (
+    <div className="settings-card settings-card-setup">
+      <div className="settings-card-copy">
+        <h3 className="settings-card-title">Controller Profile</h3>
+        <p className="settings-card-description">
+          Rewrites the key-b0x controller profile inside the Slippi config directory. Reset it when
+          Slippi or another tool has overwritten or deleted the file.
+        </p>
+      </div>
+
+      <div className="settings-actions">
+        <div className="settings-inline-note">
+          {slippiReady
+            ? 'The reset profile is picked up the next time Slippi loads the controller.'
+            : 'Set a valid Slippi user path first.'}
+        </div>
+        <div className="toolbar-actions">
+          <button
+            type="button"
+            className="button button-secondary"
+            disabled={busy || !slippiReady}
+            onClick={() => {
+              void onReset();
+            }}
+          >
+            Reset Profile File
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1168,6 +1372,54 @@ function SetupSection({
   );
 }
 
+function NerfToggleCard({
+  draft,
+  disabled,
+  onChange
+}: {
+  draft: MeleeSettingsDraft;
+  disabled: boolean;
+  onChange: (draft: MeleeSettingsDraft) => void;
+}) {
+  return (
+    <section className="settings-card settings-card-subtle">
+      <div className="settings-card-copy">
+        <h3 className="settings-card-title">Active Nerfs</h3>
+        <p className="settings-card-description">
+          Fine-tune which nerfs apply to control stick output. The c-stick is never travel-timed or
+          fuzzed, matching the ruleset.
+        </p>
+      </div>
+
+      <div className="settings-toggle-list">
+        {NERF_TOGGLE_ROWS.map((row) => {
+          const active = draft[row.field];
+
+          return (
+            <div className="settings-toggle-row" key={row.field}>
+              <div className="settings-toggle-copy">
+                <span className="settings-toggle-label">{row.label}</span>
+                <span className="settings-toggle-detail">{row.detail}</span>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={active}
+                aria-label={row.label}
+                className={`settings-toggle${active ? ' settings-toggle-active' : ''}`}
+                disabled={disabled}
+                onClick={() => onChange({ ...draft, [row.field]: !active })}
+              >
+                <span className="settings-toggle-knob" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function MeleeSettingsSection({
   meleeDraft,
   meleeDirty,
@@ -1189,13 +1441,27 @@ function MeleeSettingsSection({
     <div className="settings-stack">
       <SettingChoiceGroup
         label="SOCD Mode"
-        description="Controls overlapping opposite directions. The default matches B0XX Melee behavior; use reactivation for keyboard-like holds."
+        description="Controls overlapping opposite directions. Neutral (the default) cancels them out; 2IP No Reactivation matches B0XX Melee behavior, and reactivation suits keyboard-like holds."
         value={meleeDraft.socd_mode}
         options={SOCD_MODE_OPTIONS}
         disabled={disabled}
         columns="wide"
         onChange={(value) => onChange({ ...meleeDraft, socd_mode: value })}
       />
+
+      <SettingChoiceGroup
+        label="Rectangle Nerfs"
+        description="Applies the rectangle controller nerfs from the Melee controller ruleset proposal. Set SOCD Mode to Neutral for full ruleset compliance."
+        value={meleeDraft.nerfs_enabled ? 'enabled' : 'disabled'}
+        options={NERF_MASTER_OPTIONS}
+        disabled={disabled}
+        columns="compact"
+        onChange={(value) => onChange({ ...meleeDraft, nerfs_enabled: value === 'enabled' })}
+      />
+
+      {meleeDraft.nerfs_enabled ? (
+        <NerfToggleCard draft={meleeDraft} disabled={disabled} onChange={onChange} />
+      ) : null}
 
       <SettingChoiceGroup
         label="Down Diagonal"
@@ -1427,7 +1693,7 @@ function KeyboardTestLauncherCard({
   const note =
     context === 'onboarding'
       ? 'If a held key never appears with the others, that keyboard is likely not suitable.'
-      : 'The runtime pauses while the test is open.';
+      : 'The runtime pauses while the test is open, and resumes when the test closes or key-b0x loses focus.';
 
   return (
     <div className="settings-card settings-card-setup">
@@ -1456,10 +1722,12 @@ function KeyboardTestLauncherCard({
 function KeyboardTestModal({
   keyboardTest,
   busy,
+  keyLabel,
   onClose
 }: {
   keyboardTest: KeyboardTestState;
   busy: boolean;
+  keyLabel: (key: NormalizedKey) => string;
   onClose: () => void;
 }) {
   return (
@@ -1525,7 +1793,7 @@ function KeyboardTestModal({
               <div className="keyboard-test-key-grid">
                 {keyboardTest.pressedKeys.map((key) => (
                   <div key={key} className="keyboard-test-key">
-                    {formatKeyLabel(key)}
+                    {keyLabel(key)}
                   </div>
                 ))}
               </div>
@@ -1657,6 +1925,7 @@ function BindingsSection({
   duplicateBindings,
   captureTarget,
   bindingsDirty,
+  keyLabel,
   onRestoreDefaults,
   onSaveBindings,
   onSelectBinding
@@ -1669,6 +1938,7 @@ function BindingsSection({
   duplicateBindings: Set<BindingId>;
   captureTarget: BindingId | null;
   bindingsDirty: boolean;
+  keyLabel: (key: NormalizedKey) => string;
   onRestoreDefaults: () => void;
   onSaveBindings: () => Promise<void>;
   onSelectBinding: (binding: BindingId) => void;
@@ -1707,7 +1977,7 @@ function BindingsSection({
       </div>
 
       {duplicateGroups.length > 0 ? (
-        <div className="banner banner-warning">{duplicateMessage(duplicateGroups[0])}</div>
+        <div className="banner banner-warning">{duplicateMessage(duplicateGroups[0], keyLabel)}</div>
       ) : captureTarget ? (
         <div className="banner banner-info">Press a key. Esc cancels.</div>
       ) : bindingsDirty ? (
@@ -1739,7 +2009,7 @@ function BindingsSection({
                   >
                     <span className="binding-row-label">{formatBindingLabel(binding)}</span>
                     <span className="binding-row-key">
-                      {isCapturing ? 'Press key' : formatKeyLabel(key)}
+                      {isCapturing ? 'Press key' : keyLabel(key)}
                     </span>
                     <span className="binding-row-state">
                       {hasConflict ? 'Conflict' : 'Edit'}
@@ -1836,9 +2106,12 @@ function statusLabel(status: RuntimeState['status']): string {
   }
 }
 
-function duplicateMessage(conflict: { key: NormalizedKey; bindings: BindingId[] }): string {
+function duplicateMessage(
+  conflict: { key: NormalizedKey; bindings: BindingId[] },
+  keyLabel: (key: NormalizedKey) => string = formatKeyLabel
+): string {
   const bindingNames = conflict.bindings.map((binding) => formatBindingLabel(binding)).join(' and ');
-  return `${formatKeyLabel(conflict.key)} is assigned to ${bindingNames}.`;
+  return `${keyLabel(conflict.key)} is assigned to ${bindingNames}.`;
 }
 
 function getInitialRoute(config: AppConfig, setup: SetupStatus): AppView {
@@ -1940,10 +2213,12 @@ function formatUpdateProgress(updateState: UpdateState): string | null {
 
 function getDashboardNotice({
   setupComplete,
-  duplicateGroups
+  duplicateGroups,
+  keyLabel
 }: {
   setupComplete: boolean;
   duplicateGroups: Array<{ key: NormalizedKey; bindings: BindingId[] }>;
+  keyLabel: (key: NormalizedKey) => string;
 }): { tone: 'warning' | 'info'; message: string } | null {
   if (!setupComplete) {
     return {
@@ -1955,7 +2230,7 @@ function getDashboardNotice({
   if (duplicateGroups.length > 0) {
     return {
       tone: 'warning',
-      message: duplicateMessage(duplicateGroups[0])
+      message: duplicateMessage(duplicateGroups[0], keyLabel)
     };
   }
 
@@ -2000,7 +2275,22 @@ function meleeDraftFromConfig(melee: MeleeConfig): MeleeSettingsDraft {
     airdodge_x:
       melee.airdodge.kind === 'custom_mod_x_diagonal' ? formatDraftNumber(melee.airdodge.x) : '',
     airdodge_y:
-      melee.airdodge.kind === 'custom_mod_x_diagonal' ? formatDraftNumber(melee.airdodge.y) : ''
+      melee.airdodge.kind === 'custom_mod_x_diagonal' ? formatDraftNumber(melee.airdodge.y) : '',
+    nerfs_enabled: melee.nerfs.enabled,
+    nerfs_travel_time: melee.nerfs.travel_time,
+    nerfs_fuzzing: melee.nerfs.fuzzing,
+    nerfs_coordinate_limits: melee.nerfs.coordinate_limits,
+    nerfs_timing_lockouts: melee.nerfs.timing_lockouts
+  };
+}
+
+function nerfConfigFromDraft(draft: MeleeSettingsDraft): MeleeConfig['nerfs'] {
+  return {
+    enabled: draft.nerfs_enabled,
+    travel_time: draft.nerfs_travel_time,
+    fuzzing: draft.nerfs_fuzzing,
+    coordinate_limits: draft.nerfs_coordinate_limits,
+    timing_lockouts: draft.nerfs_timing_lockouts
   };
 }
 
@@ -2014,7 +2304,8 @@ function meleeConfigFromDraft(draft: MeleeSettingsDraft): MeleeConfig {
         kind: 'custom_mod_x_diagonal',
         x: Number(draft.airdodge_x.trim()),
         y: Number(draft.airdodge_y.trim())
-      }
+      },
+      nerfs: nerfConfigFromDraft(draft)
     };
   }
 
@@ -2024,7 +2315,8 @@ function meleeConfigFromDraft(draft: MeleeSettingsDraft): MeleeConfig {
     horizontal_socd_override: draft.horizontal_socd_override,
     airdodge: {
       kind: 'default'
-    }
+    },
+    nerfs: nerfConfigFromDraft(draft)
   };
 }
 
@@ -2062,7 +2354,12 @@ function meleeDraftMatchesConfig(draft: MeleeSettingsDraft, melee: MeleeConfig):
     draft.socd_mode !== melee.socd.c_y ||
     draft.down_diagonal !== melee.down_diagonal ||
     draft.horizontal_socd_override !== melee.horizontal_socd_override ||
-    draft.airdodge_kind !== melee.airdodge.kind
+    draft.airdodge_kind !== melee.airdodge.kind ||
+    draft.nerfs_enabled !== melee.nerfs.enabled ||
+    draft.nerfs_travel_time !== melee.nerfs.travel_time ||
+    draft.nerfs_fuzzing !== melee.nerfs.fuzzing ||
+    draft.nerfs_coordinate_limits !== melee.nerfs.coordinate_limits ||
+    draft.nerfs_timing_lockouts !== melee.nerfs.timing_lockouts
   ) {
     return false;
   }

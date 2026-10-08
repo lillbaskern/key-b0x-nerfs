@@ -118,7 +118,10 @@ mod imp {
         (0x36, ShiftRight),
         (0x38, AltLeft),
         (0x39, Space),
-        (0x3A, CapsLock)
+        (0x3A, CapsLock),
+        // ISO keyboards only: the extra key next to Left Shift (<>| on
+        // Nordic/German layouts, <> on French).
+        (0x56, IntlBackslash)
     }
 
     extended_scancode_pairs! {
@@ -631,6 +634,11 @@ mod imp {
                 Some(NormalizedKey::BracketRight)
             );
             assert_eq!(key_from_base_scancode(0x2F), Some(NormalizedKey::KeyV));
+            // ISO 102nd key next to Left Shift.
+            assert_eq!(
+                key_from_base_scancode(0x56),
+                Some(NormalizedKey::IntlBackslash)
+            );
         }
 
         #[test]

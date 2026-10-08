@@ -53,6 +53,13 @@ const defaultConfig: AppConfig = {
     horizontal_socd_override: 'max_jump_trajectory',
     airdodge: {
       kind: 'default'
+    },
+    nerfs: {
+      enabled: true,
+      travel_time: true,
+      fuzzing: true,
+      coordinate_limits: true,
+      timing_lockouts: true
     }
   }
 };
@@ -246,6 +253,42 @@ describe('App', () => {
     });
   });
 
+  it('labels keys from the layout map even when the Keyboard object has no events', async () => {
+    // WebView2 exposes getLayoutMap but its Keyboard object is not an
+    // EventTarget (no addEventListener). The app must still mount and use
+    // the layout map for key labels instead of crashing to a blank screen.
+    const originalKeyboard = navigator.keyboard;
+    Object.defineProperty(navigator, 'keyboard', {
+      configurable: true,
+      value: {
+        getLayoutMap: async () =>
+          new Map([
+            ['BracketLeft', 'ö'],
+            ['Slash', '-']
+          ])
+      }
+    });
+
+    try {
+      mockApi.getConfig.mockResolvedValue({
+        ...structuredClone(defaultConfig),
+        onboarding_completed: true
+      });
+      mockApi.checkSetup.mockResolvedValue(completeSetup);
+
+      render(<App />);
+
+      // The Z action is bound to BracketLeft, which types "ö" (shown as "Ö",
+      // matching the uppercase styling of the other labels) on Swedish.
+      expect((await screen.findAllByText('Ö')).length).toBeGreaterThan(0);
+    } finally {
+      Object.defineProperty(navigator, 'keyboard', {
+        configurable: true,
+        value: originalKeyboard
+      });
+    }
+  });
+
   it('explains the held-direction tradeoff in SOCD settings', async () => {
     mockApi.getConfig.mockResolvedValue({
       ...structuredClone(defaultConfig),
@@ -265,6 +308,92 @@ describe('App', () => {
         'Release the newer opposite direction: return to the direction still held'
       )
     ).toBeTruthy();
+  });
+
+  it('shows Neutral first and tags it as the default SOCD mode', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+    const socdGroup = await screen.findByRole('group', { name: 'SOCD Mode' });
+
+    const neutral = within(socdGroup).getByText('Neutral').closest('button');
+    expect(neutral?.textContent).toContain('Default');
+
+    const options = within(socdGroup).getAllByRole('button');
+    expect(options[0]?.textContent).toContain('Neutral');
+    expect(options[0]?.textContent).toContain('Default');
+    // Only one option carries the tag.
+    expect(
+      options.filter((option) => option.textContent?.includes('Default'))
+    ).toHaveLength(1);
+  });
+
+  it('exposes rectangle nerf toggles in melee settings', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+    mockApi.saveConfig.mockImplementation(async (config: AppConfig) => config);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+
+    const nerfGroup = await screen.findByRole('group', { name: 'Rectangle Nerfs' });
+    expect(within(nerfGroup).getByText('Enabled')).toBeTruthy();
+    expect(within(nerfGroup).getByText('Disabled')).toBeTruthy();
+
+    const travelSwitch = await screen.findByRole('switch', { name: 'Travel Time Simulation' });
+    expect(travelSwitch.getAttribute('aria-checked')).toBe('true');
+
+    fireEvent.click(travelSwitch);
+    expect(travelSwitch.getAttribute('aria-checked')).toBe('false');
+    expect(screen.getByRole('switch', { name: 'Output Fuzzing' }).getAttribute('aria-checked')).toBe(
+      'true'
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Melee Settings' }));
+    await waitFor(() => expect(mockApi.saveConfig).toHaveBeenCalledTimes(1));
+
+    const saved = mockApi.saveConfig.mock.calls[0][0] as AppConfig;
+    expect(saved.melee.nerfs).toEqual({
+      enabled: true,
+      travel_time: false,
+      fuzzing: true,
+      coordinate_limits: true,
+      timing_lockouts: true
+    });
+  });
+
+  it('hides per-nerf toggles when rectangle nerfs are disabled', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+
+    const nerfGroup = await screen.findByRole('group', { name: 'Rectangle Nerfs' });
+    expect(
+      within(nerfGroup).getByRole('button', { name: /^Enabled/ }).getAttribute('aria-pressed')
+    ).toBe('true');
+
+    fireEvent.click(within(nerfGroup).getByRole('button', { name: /^Disabled/ }));
+
+    expect(screen.queryByRole('switch', { name: 'Travel Time Simulation' })).toBeNull();
+    expect(
+      within(nerfGroup).getByRole('button', { name: /^Disabled/ }).getAttribute('aria-pressed')
+    ).toBe('true');
   });
 
   it('updates the visible runtime status from runtime events', async () => {
@@ -484,5 +613,218 @@ describe('App', () => {
     expect(screen.getByText('A')).toBeTruthy();
     expect(screen.getByText('S')).toBeTruthy();
     expect(screen.getByText('Space')).toBeTruthy();
+  });
+
+  it('resumes the runtime when the keyboard test is dismissed via the backdrop', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+    mockApi.getRuntimeState.mockResolvedValue(runningRuntime);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Keyboard Test' }));
+
+    // Opening the keyboard test from settings stops the live runtime first.
+    await waitFor(() => {
+      expect(mockApi.stopRuntime).toHaveBeenCalledTimes(1);
+    });
+    await screen.findByRole('dialog', { name: 'Keyboard Test' });
+
+    // Dismiss by clicking the backdrop outside the modal body.
+    const backdrop = document.querySelector('.keyboard-test-shell');
+    expect(backdrop).toBeTruthy();
+    fireEvent.click(backdrop as Element);
+
+    await waitFor(() => {
+      expect(mockApi.stopKeyboardTest).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.queryByRole('dialog', { name: 'Keyboard Test' })).toBeNull();
+
+    // The runtime must come back after the test closes.
+    await waitFor(() => {
+      expect(mockApi.startRuntime).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('closes the keyboard test and resumes the runtime when the window loses focus', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+    mockApi.getRuntimeState.mockResolvedValue(runningRuntime);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Keyboard Test' }));
+
+    await waitFor(() => {
+      expect(mockApi.stopRuntime).toHaveBeenCalledTimes(1);
+    });
+    await screen.findByRole('dialog', { name: 'Keyboard Test' });
+
+    await act(async () => {
+      window.dispatchEvent(new Event('blur'));
+    });
+
+    await waitFor(() => {
+      expect(mockApi.stopKeyboardTest).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.queryByRole('dialog', { name: 'Keyboard Test' })).toBeNull();
+
+    await waitFor(() => {
+      expect(mockApi.startRuntime).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('does not regress the status when a delayed start response lands after newer events', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+    mockApi.getRuntimeState.mockResolvedValue(runningRuntime);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Keyboard Test' }));
+
+    await waitFor(() => {
+      expect(mockApi.stopRuntime).toHaveBeenCalledTimes(1);
+    });
+    await screen.findByRole('dialog', { name: 'Keyboard Test' });
+
+    // The runtime restart's command response is delayed. Backend state
+    // events (a separate IPC channel with no ordering against command
+    // responses) report Starting and then Running before it lands.
+    let resolveStart!: (state: RuntimeState) => void;
+    mockApi.startRuntime.mockReturnValue(
+      new Promise<RuntimeState>((resolve) => {
+        resolveStart = resolve;
+      })
+    );
+
+    const backdrop = document.querySelector('.keyboard-test-shell');
+    fireEvent.click(backdrop as Element);
+
+    await waitFor(() => {
+      expect(mockApi.startRuntime).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      runtimeListener?.({ status: 'starting', startedAt: 123, lastError: null });
+      runtimeListener?.({ status: 'running', startedAt: 123, lastError: null });
+    });
+    expect(screen.getByText('Running')).toBeTruthy();
+
+    // The stale response finally lands — it must not clobber the newer state.
+    await act(async () => {
+      resolveStart({ status: 'starting', startedAt: 123, lastError: null });
+    });
+    expect(screen.getByText('Running')).toBeTruthy();
+  });
+
+  it('runs a deferred close when the window loses focus while the test is still opening', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+    mockApi.getRuntimeState.mockResolvedValue(runningRuntime);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+
+    let resolveStartTest!: (state: KeyboardTestState) => void;
+    mockApi.startKeyboardTest.mockReturnValue(
+      new Promise<KeyboardTestState>((resolve) => {
+        resolveStartTest = resolve;
+      })
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Keyboard Test' }));
+
+    await waitFor(() => {
+      expect(mockApi.stopRuntime).toHaveBeenCalledTimes(1);
+    });
+
+    // The window loses focus while the keyboard test is still opening.
+    await act(async () => {
+      window.dispatchEvent(new Event('blur'));
+    });
+    expect(mockApi.stopKeyboardTest).not.toHaveBeenCalled();
+
+    // Once the open settles, the queued close runs and resumes the runtime.
+    await act(async () => {
+      resolveStartTest(runningKeyboardTest);
+    });
+
+    await waitFor(() => {
+      expect(mockApi.stopKeyboardTest).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
+      expect(mockApi.startRuntime).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.queryByRole('dialog', { name: 'Keyboard Test' })).toBeNull();
+  });
+
+  it('reinstalls the controller profile from settings', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+
+    const resetButton = await screen.findByRole('button', { name: 'Reset Profile File' });
+    fireEvent.click(resetButton);
+
+    // The button locks while the reinstall is in flight.
+    expect(
+      (screen.getByRole('button', { name: 'Reset Profile File' }) as HTMLButtonElement).disabled
+    ).toBe(true);
+
+    await waitFor(() => {
+      expect(mockApi.installProfile).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByText('Controller profile reset.')).toBeTruthy();
+
+    await waitFor(() => {
+      expect(
+        (screen.getByRole('button', { name: 'Reset Profile File' }) as HTMLButtonElement).disabled
+      ).toBe(false);
+    });
+  });
+
+  it('surfaces profile reinstall failures as an error toast', async () => {
+    mockApi.getConfig.mockResolvedValue({
+      ...structuredClone(defaultConfig),
+      onboarding_completed: true
+    });
+    mockApi.checkSetup.mockResolvedValue(completeSetup);
+    mockApi.installProfile.mockRejectedValueOnce(new Error('profile write failed'));
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open settings' }));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Reset Profile File' }));
+
+    expect(await screen.findByText('profile write failed')).toBeTruthy();
+    await waitFor(() => {
+      expect(
+        (screen.getByRole('button', { name: 'Reset Profile File' }) as HTMLButtonElement).disabled
+      ).toBe(false);
+    });
   });
 });

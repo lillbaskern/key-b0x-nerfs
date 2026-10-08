@@ -45,6 +45,7 @@ export const NORMALIZED_KEYS = [
   'BracketLeft',
   'BracketRight',
   'Backslash',
+  'IntlBackslash',
   'Semicolon',
   'Quote',
   'Backquote',
@@ -148,20 +149,38 @@ export interface MeleeConfig {
   down_diagonal: DownDiagonalBehavior;
   horizontal_socd_override: HorizontalSocdOverride;
   airdodge: AirdodgeConfig;
+  nerfs: NerfConfig;
 }
+
+export interface NerfConfig {
+  enabled: boolean;
+  travel_time: boolean;
+  fuzzing: boolean;
+  coordinate_limits: boolean;
+  timing_lockouts: boolean;
+}
+
+export const DEFAULT_NERF_CONFIG: NerfConfig = {
+  enabled: true,
+  travel_time: true,
+  fuzzing: true,
+  coordinate_limits: true,
+  timing_lockouts: true
+};
 
 export const DEFAULT_MELEE_CONFIG: MeleeConfig = {
   socd: {
-    main_x: 'second_input_priority_no_reactivation',
-    main_y: 'second_input_priority_no_reactivation',
-    c_x: 'second_input_priority_no_reactivation',
-    c_y: 'second_input_priority_no_reactivation'
+    main_x: 'neutral',
+    main_y: 'neutral',
+    c_x: 'neutral',
+    c_y: 'neutral'
   },
   down_diagonal: 'auto_jab_cancel',
   horizontal_socd_override: 'max_jump_trajectory',
   airdodge: {
     kind: 'default'
-  }
+  },
+  nerfs: { ...DEFAULT_NERF_CONFIG }
 };
 
 export interface AppConfig {
@@ -375,6 +394,7 @@ const KEY_LABELS: Record<NormalizedKey, string> = {
   BracketLeft: '[',
   BracketRight: ']',
   Backslash: '\\',
+  IntlBackslash: '\\',
   Semicolon: ';',
   Quote: "'",
   Backquote: '`',
@@ -413,7 +433,8 @@ export function cloneMeleeConfig(melee: MeleeConfig): MeleeConfig {
     airdodge:
       melee.airdodge.kind === 'custom_mod_x_diagonal'
         ? { ...melee.airdodge }
-        : { kind: 'default' }
+        : { kind: 'default' },
+    nerfs: { ...melee.nerfs }
   };
 }
 
@@ -423,6 +444,31 @@ export function formatBindingLabel(binding: BindingId): string {
 
 export function formatKeyLabel(key: NormalizedKey): string {
   return KEY_LABELS[key];
+}
+
+/**
+ * Resolves the display label for a physical key under the user's active
+ * keyboard layout. Bindings are stored as physical keys (DOM "code"-style
+ * names), so on non-US layouts the US legend in KEY_LABELS can differ from
+ * what is printed on the keycap. `layoutMap` comes from
+ * `navigator.keyboard.getLayoutMap()` and maps each physical key to the
+ * character the active layout produces without modifiers. When the map is
+ * unavailable (unsupported webview, lookup miss, modifier/function keys
+ * which have no character), the US fallback label is used.
+ */
+export function layoutKeyLabel(
+  key: NormalizedKey,
+  layoutMap?: ReadonlyMap<string, string>
+): string {
+  const mapped = layoutMap?.get(key);
+  if (!mapped) {
+    return KEY_LABELS[key];
+  }
+  // Match the uppercase styling of the US labels (A-Z), including accented
+  // letters (å -> Å). Some characters expand when uppercased (ß -> SS); keep
+  // their keycap form in that case.
+  const upper = mapped.toUpperCase();
+  return upper.length === 1 ? upper : mapped;
 }
 
 export function findDuplicateBindings(bindings: BindingMap): Array<{
