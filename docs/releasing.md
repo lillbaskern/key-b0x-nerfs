@@ -103,8 +103,10 @@ In-app updates are owned entirely by this repository:
 
 - Public release remains gated on manual installer verification on both Linux
   and Windows.
-- Reserve the protected GitHub `release` environment for Windows signing
-  secrets before the first public release.
+- Signing secrets (`TAURI_SIGNING_PRIVATE_KEY`, `SIGNPATH_*`) are
+  repository-level Actions secrets consumed by the `bundle` job. The
+  `release` environment applies only to the `publish` job; add required
+  reviewers there if you want an approval gate before draft releases.
 - Linux AppImage releases target modern Linux distributions rather than
   oldest-possible glibc compatibility.
 - In-app updates require one manual bridge release first: builds up to 0.1.1

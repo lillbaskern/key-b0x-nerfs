@@ -41,8 +41,10 @@ if (-not $env:SIGNPATH_API_TOKEN) {
     exit 0
 }
 
+# Check the value, not just presence: CI declares these as env: mappings,
+# which exist-but-empty when the secret has not been created yet.
 foreach ($name in @('SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG')) {
-    if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue)) {
+    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
         throw "SIGNPATH_API_TOKEN is set but $name is missing - refusing to continue."
     }
 }
