@@ -20,8 +20,10 @@ The repo uses three GitHub Actions workflows:
 3. Let `bundle-smoke.yml` build the real installers from `main`.
 4. Manually validate the Linux AppImage and Windows NSIS installer before any
    public release.
-5. Verify updater signing secrets are present in GitHub Actions:
-   `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+5. Verify the updater signing secret is present in GitHub Actions:
+   `TAURI_SIGNING_PRIVATE_KEY` (content of the updater key — see
+   *Updater signing* below; `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is only
+   needed if the key has a password).
 6. Create a `vX.Y.Z` tag.
 7. Let `release.yml` build the same packaging matrix and create a draft GitHub
    Release.
@@ -72,6 +74,31 @@ software when the repo is a **visible GitHub fork** of an upstream project
 that publishes signed builds, with releases based on upstream branches. If
 that cannot be satisfied, the application will not be approved for signing.
 
+## Updater signing (fork-owned)
+
+In-app updates are owned entirely by this repository:
+
+- `bundle.createUpdaterArtifacts` is `true`, so builds emit a minisign
+  `.sig` next to each installer — `release.yml` and `bundle-smoke.yml` both
+  assert that exactly one exists per platform.
+- `plugins.updater.endpoints` points at this repo's
+  `releases/latest/download/latest.json`, and `plugins.updater.pubkey` holds
+  this fork's public key. `release.yml` embeds each installer's signature in
+  the generated `latest.json`.
+- The private key lives at `~\.tauri\key-b0x-nerfs.key` (with `.key.pub`).
+  **Never commit either file.** Paste the `.key` file's content into the
+  `TAURI_SIGNING_PRIVATE_KEY` Actions secret — the bundler ignores
+  `TAURI_SIGNING_PRIVATE_KEY_PATH`, the value must be the key itself. The
+  key has no password, so `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` can stay
+  unset.
+- Signing order and SignPath coexist safely: Tauri runs the Authenticode
+  `signCommand` on the finished installer first, then generates the `.sig`
+  over those signed bytes, so both signatures verify on the final file.
+- Rotating the updater key breaks in-app updates for every previously
+  shipped build (they verify against the pubkey baked in at their build
+  time) and would require another manual bridge release. Only rotate if
+  the key is lost or compromised.
+
 ## Notes
 
 - Public release remains gated on manual installer verification on both Linux
@@ -80,8 +107,11 @@ that cannot be satisfied, the application will not be approved for signing.
   secrets before the first public release.
 - Linux AppImage releases target modern Linux distributions rather than
   oldest-possible glibc compatibility.
-- In-app updates require one manual bridge release first. After users install
-  that updater-enabled release once, future Linux AppImage and Windows NSIS
-  upgrades can be delivered in-app.
+- In-app updates require one manual bridge release first: builds up to 0.1.1
+  embedded upstream's updater endpoint and public key, so they cannot verify
+  fork-signed updates. Install the first fork-owned release manually once;
+  every release after that can be delivered in-app.
+- GitHub Actions must be enabled for the repository (Settings → Actions)
+  before any workflow can run.
 - For Linux in-app updates, keep the AppImage in a stable writable location
   such as `~/Applications/key-b0x.AppImage`.

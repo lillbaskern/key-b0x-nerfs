@@ -12,7 +12,7 @@ without digging through repo internals.
 
 ## Download
 
-1. Open the [latest release](https://github.com/arismoko/key-b0x/releases/latest).
+1. Open the [latest release](https://github.com/lillbaskern/key-b0x-nerfs/releases/latest).
 2. Click `Assets` if the download files are collapsed.
 3. Download the file for your platform:
 
