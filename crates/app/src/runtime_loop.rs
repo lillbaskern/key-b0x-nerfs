@@ -101,25 +101,51 @@ fn run_capture_loop(context: &RuntimeWorkerContext) -> Result<()> {
     record_transport_status(context, initial_status, &mut last_reconnect_probe_at);
     let mut last_transport_status = initial_status;
 
-    while !context.cancel.load(Ordering::Relaxed) {
-        let changes = capture.wait_for_events(next_wait_timeout(
+    // Loop failures are collected instead of propagated with `?` so the shared
+    // teardown below always runs: a worker that dies mid-input must still leave
+    // the game with a neutral controller rather than the last stale diagonal
+    // (which reads as a stick that hangs for seconds until the runtime is
+    // restarted by hand).
+    let mut loop_error = None;
+    'capture: while !context.cancel.load(Ordering::Relaxed) {
+        let changes = match capture.wait_for_events(next_wait_timeout(
             last_transport_status,
             last_reconnect_probe_at.elapsed(),
             engine.is_traveling(),
-        ))?;
+        )) {
+            Ok(changes) => changes,
+            Err(error) => {
+                loop_error = Some(error);
+                break 'capture;
+            }
+        };
         if changes.is_empty() {
             if engine.is_traveling() {
                 engine.tick(Instant::now());
-                let status = emitter.emit(&engine.snapshot())?;
-                record_transport_status(context, status, &mut last_reconnect_probe_at);
-                last_transport_status = status;
+                match emitter.emit(&engine.snapshot()) {
+                    Ok(status) => {
+                        record_transport_status(context, status, &mut last_reconnect_probe_at);
+                        last_transport_status = status;
+                    }
+                    Err(error) => {
+                        loop_error = Some(error);
+                        break 'capture;
+                    }
+                }
             } else if should_probe_reconnect(
                 last_transport_status,
                 last_reconnect_probe_at.elapsed(),
             ) {
-                let status = emitter.emit(&engine.snapshot())?;
-                record_transport_status(context, status, &mut last_reconnect_probe_at);
-                last_transport_status = status;
+                match emitter.emit(&engine.snapshot()) {
+                    Ok(status) => {
+                        record_transport_status(context, status, &mut last_reconnect_probe_at);
+                        last_transport_status = status;
+                    }
+                    Err(error) => {
+                        loop_error = Some(error);
+                        break 'capture;
+                    }
+                }
             }
             continue;
         }
@@ -130,14 +156,21 @@ fn run_capture_loop(context: &RuntimeWorkerContext) -> Result<()> {
                     binding,
                     pressed: change.pressed,
                 });
-                let status = emitter.emit(&snapshot)?;
-                record_transport_status(context, status, &mut last_reconnect_probe_at);
-                last_transport_status = status;
-                latency_logger.record(change.observed_at.elapsed(), status);
+                match emitter.emit(&snapshot) {
+                    Ok(status) => {
+                        record_transport_status(context, status, &mut last_reconnect_probe_at);
+                        last_transport_status = status;
+                        latency_logger.record(change.observed_at.elapsed(), status);
+                    }
+                    Err(error) => {
+                        loop_error = Some(error);
+                        break 'capture;
+                    }
+                }
             }
 
             if context.cancel.load(Ordering::Relaxed) {
-                break;
+                break 'capture;
             }
         }
     }
@@ -148,7 +181,11 @@ fn run_capture_loop(context: &RuntimeWorkerContext) -> Result<()> {
         apply_transport_status(&context, status);
     }
     capture.release()?;
-    Ok(())
+
+    match loop_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn apply_transport_status(context: &RuntimeWorkerContext, status: TransportStatus) {

@@ -867,4 +867,91 @@ mod tests {
         assert!(!engine.is_traveling());
         approx_eq(snapshot.main_x, normalize_axis(1.0));
     }
+
+    #[test]
+    fn releasing_left_with_down_held_never_sticks_on_a_diagonal() {
+        // Regression: "hold down-left, release left, keep holding down" left
+        // the stick diagonal. With nerfs off the release itself must already
+        // be a cardinal down in every SOCD mode, and the diagonal must never
+        // creep back in while down stays held.
+        for socd in [
+            SocdMode::Neutral,
+            SocdMode::SecondInputPriority,
+            SocdMode::SecondInputPriorityNoReactivation,
+            SocdMode::Dir1Priority,
+            SocdMode::Dir2Priority,
+        ] {
+            let mut config = plain_config();
+            config.socd.main_x = socd;
+            let mut engine = MeleeEngine::try_new(config).expect("config must be valid");
+
+            press(&mut engine, BindingId::AnalogLeft);
+            let diagonal = press(&mut engine, BindingId::AnalogDown);
+            assert!(
+                diagonal.main_x < normalize_axis(-0.5) && diagonal.main_y < normalize_axis(-0.5),
+                "{socd:?}: expected a down-left diagonal, got {} {}",
+                diagonal.main_x,
+                diagonal.main_y
+            );
+
+            let start = Instant::now();
+            let released = release(&mut engine, BindingId::AnalogLeft);
+            approx_eq(released.main_x, normalize_axis(0.0));
+            assert!(
+                released.main_y < normalize_axis(-0.5),
+                "{socd:?}: down must stay held"
+            );
+
+            for settle_ms in [50u64, 100, 250] {
+                engine.tick(start + Duration::from_millis(settle_ms));
+                let snapshot = engine.snapshot();
+                approx_eq(snapshot.main_x, normalize_axis(0.0));
+                assert!(
+                    snapshot.main_y < normalize_axis(-0.5),
+                    "{socd:?}: down must stay held"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn releasing_left_with_down_held_recovers_after_nerf_lockouts_and_travel() {
+        // Same sequence against the full default nerf stack. The SDI lockout
+        // may intentionally hold the previous diagonal for up to 91 ms, and
+        // re-evaluates on the next input frame (a held key's typematic
+        // repeat), so the diagonal must resolve at that next frame and stay
+        // resolved.
+        let mut engine = MeleeEngine::default();
+
+        press(&mut engine, BindingId::AnalogLeft);
+        press(&mut engine, BindingId::AnalogDown);
+        engine.tick(Instant::now() + Duration::from_millis(50));
+
+        let start = Instant::now();
+        // The release can land inside the SDI window opened by the diagonal,
+        // so the lockout may hold the old diagonal until that window (91 ms)
+        // elapses - by design.
+        release(&mut engine, BindingId::AnalogLeft);
+
+        // The held down key's next typematic repeat arrives after the window
+        // and must resolve the stick to a cardinal down. The lockout window
+        // runs on the real clock, so wait it out the way the keyboard would.
+        std::thread::sleep(Duration::from_millis(100));
+        press(&mut engine, BindingId::AnalogDown);
+
+        for settle_ms in [150u64, 250, 500] {
+            engine.tick(start + Duration::from_millis(settle_ms));
+            let snapshot = engine.snapshot();
+            assert!(
+                (snapshot.main_x - normalize_axis(0.0)).abs() < 0.05,
+                "main_x stuck at {} {} ms after the release",
+                snapshot.main_x,
+                settle_ms
+            );
+            assert!(
+                snapshot.main_y < normalize_axis(-0.5),
+                "down must stay held"
+            );
+        }
+    }
 }
